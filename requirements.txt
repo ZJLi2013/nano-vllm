@@ -1,0 +1,10 @@
+
+transformers 
+xxhash
+torch
+transformers
+triton
+flash-attn>=2.8.3
+flash-infer
+
+
