@@ -363,8 +363,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
-        "mlp.experts": ("mlp.gate_up_weights", "expert"),
-        "mlp.experts": ("mlp.down_weights", "expert"),
+        "mlp.experts.gate_proj": ("mlp.gate_up_weights", "expert"),
+        "mlp.experts.up_proj": ("mlp.gate_up_weights", "expert"),
+        "mlp.experts.down_proj": ("mlp.down_weights", "expert"),
     }
 
     def __init__(self, config: Qwen3Config) -> None:
