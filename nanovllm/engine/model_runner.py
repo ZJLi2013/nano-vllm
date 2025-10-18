@@ -118,17 +118,15 @@ class ModelRunner:
         print(f"[DEBUG warmup_model] Starting warmup for rank {self.rank}")
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
-        )
-        num_seqs = min(
-            max_num_batched_tokens // max_model_len, self.config.max_num_seqs
-        )
+
+        # Use smaller warmup batch to avoid memory issues
+        warmup_seq_len = min(512, self.config.max_model_len)
+        warmup_num_seqs = min(2, self.config.max_num_seqs)
+
         print(
-            f"[DEBUG warmup_model] Creating {num_seqs} sequences of length {max_model_len}"
+            f"[DEBUG warmup_model] Creating {warmup_num_seqs} sequences of length {warmup_seq_len}"
         )
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        seqs = [Sequence([0] * warmup_seq_len) for _ in range(warmup_num_seqs)]
         print(f"[DEBUG warmup_model] Calling run() with {len(seqs)} sequences")
         self.run(seqs, True)
         print(f"[DEBUG warmup_model] Run completed, emptying cache")
@@ -348,12 +346,19 @@ class ModelRunner:
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
+        print(
+            f"[DEBUG run_model] Starting with input_ids shape: {input_ids.shape}, is_prefill={is_prefill}"
+        )
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            print(f"[DEBUG run_model] Running prefill/eager mode")
+            result = self.model.compute_logits(self.model(input_ids, positions))
+            print(f"[DEBUG run_model] Prefill completed, result shape: {result.shape}")
+            return result
             """
                 Prefill 吐出首字
             """
         else:
+            print(f"[DEBUG run_model] Running decode mode with CUDA graphs")
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -371,7 +376,9 @@ class ModelRunner:
             """
                 TODO: 
             """
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            result = self.model.compute_logits(graph_vars["outputs"][:bs])
+            print(f"[DEBUG run_model] Decode completed, result shape: {result.shape}")
+            return result
             """
                 decode 每计算一步，就转换一个 词表 token
             """
