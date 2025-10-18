@@ -368,16 +368,27 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(nn.Module):
-    # FIXED: Updated packed_modules_mapping to handle expert weights properly
+    # packed_modules_mapping = {
+    #     "experts.gate_proj": ("gate_up_weights", "expert"),
+    #     "experts.up_proj": ("gate_up_weights", "expert"),
+    #     "experts.down_proj": ("down_weights", "expert"),
+    #     "q_proj": ("qkv_proj", "q"),
+    #     "k_proj": ("qkv_proj", "k"),
+    #     "v_proj": ("qkv_proj", "v"),
+    #     "gate_proj": ("gate_up_proj", 0),
+    #     "up_proj": ("gate_up_proj", 1),
+    # }
+
     packed_modules_mapping = {
-        "experts.gate_proj": ("gate_up_weights", "expert"),
-        "experts.up_proj": ("gate_up_weights", "expert"),
-        "experts.down_proj": ("down_weights", "expert"),
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
     }
 
     def __init__(self, config: Qwen3Config) -> None:
@@ -399,3 +410,56 @@ class Qwen3MoeForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        """Get expert weight mapping for MoE layers.
+
+        Returns:
+            List of tuples: (param_name, weight_name, expert_id, shard_id)
+        """
+        expert_mapping = []
+        config = (
+            self.model.layers[0].mlp.config
+            if hasattr(self.model.layers[0].mlp, "config")
+            else None
+        )
+
+        if config and hasattr(config, "num_experts"):
+            num_experts = config.num_experts
+            # Add expert mappings for all MoE layers
+            for layer_idx, layer in enumerate(self.model.layers):
+                if (
+                    hasattr(layer.mlp, "total_num_experts")
+                    and layer.mlp.total_num_experts > 0
+                ):
+                    # MoE layer - add expert mappings
+                    for expert_id in range(num_experts):
+                        # gate_proj -> gate_up_weights
+                        expert_mapping.append(
+                            (
+                                f"model.layers.{layer_idx}.mlp.gate_up_weights",
+                                f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight",
+                                expert_id,
+                                "gate",
+                            )
+                        )
+                        # up_proj -> gate_up_weights
+                        expert_mapping.append(
+                            (
+                                f"model.layers.{layer_idx}.mlp.gate_up_weights",
+                                f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight",
+                                expert_id,
+                                "up",
+                            )
+                        )
+                        # down_proj -> down_weights
+                        expert_mapping.append(
+                            (
+                                f"model.layers.{layer_idx}.mlp.down_weights",
+                                f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight",
+                                expert_id,
+                                "down",
+                            )
+                        )
+
+        return expert_mapping
