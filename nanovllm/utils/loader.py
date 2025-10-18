@@ -58,7 +58,7 @@ def load_model(model: nn.Module, model_path: str):
 
     for filepath in tqdm(unsharded_paths, desc="Loading weights"):
         logger.debug(f"Loading weights from: {filepath}")
-        state_dict = torch.load(filepath, map_location="cpu", mmap=True)
+        state_dict = torch.load(filepath, map_location="cpu")
 
         for weight_name, weight_data in state_dict.items():
             # Skip expert weights if we're not loading all experts
