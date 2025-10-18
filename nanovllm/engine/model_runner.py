@@ -21,6 +21,7 @@ MODEL_REGISTRY = {
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        print(f"[DEBUG ModelRunner] Starting initialization for rank {rank}")
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -29,9 +30,11 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        print(f"[DEBUG ModelRunner] Initializing process group for rank {rank}")
         dist.init_process_group(
             "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
         )
+        print(f"[DEBUG ModelRunner] Process group initialized for rank {rank}")
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -40,24 +43,35 @@ class ModelRunner:
         model_class = MODEL_REGISTRY.get(architecture)
         if model_class is None:
             raise ValueError(f"Unsupported model architecture: {architecture}")
+        print(f"[DEBUG ModelRunner] Creating model instance for rank {rank}")
         self.model = model_class(hf_config)
+        print(f"[DEBUG ModelRunner] Loading model weights for rank {rank}")
         load_model(self.model, config.model)
+        print(f"[DEBUG ModelRunner] Weights loaded for rank {rank}")
         self.sampler = Sampler()
+        print(f"[DEBUG ModelRunner] Warming up model for rank {rank}")
         self.warmup_model()
+        print(f"[DEBUG ModelRunner] Allocating KV cache for rank {rank}")
         self.allocate_kv_cache()
         if not self.enforce_eager:
+            print(f"[DEBUG ModelRunner] Capturing CUDA graphs for rank {rank}")
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
+                print(f"[DEBUG ModelRunner] Creating shared memory for rank {rank}")
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
+                print(f"[DEBUG ModelRunner] Rank {rank} passed barrier")
             else:
                 dist.barrier()
+                print(f"[DEBUG ModelRunner] Rank {rank} passed barrier")
                 self.shm = SharedMemory(name="nanovllm")
+                print(f"[DEBUG ModelRunner] Starting loop for rank {rank}")
                 self.loop()
+        print(f"[DEBUG ModelRunner] Initialization completed for rank {rank}")
 
     def exit(self):
         if self.world_size > 1:
@@ -127,9 +141,13 @@ class ModelRunner:
             print(f"[DEBUG] Total GPU Memory: {total / 1024**3:.2f} GiB")
             print(f"[DEBUG] Free GPU Memory: {free / 1024**3:.2f} GiB")
             print(f"[DEBUG] Used GPU Memory (by everything): {used / 1024**3:.2f} GiB")
-            print(f"[DEBUG] Peak PyTorch Memory (during load): {peak / 1024**3:.2f} GiB")
+            print(
+                f"[DEBUG] Peak PyTorch Memory (during load): {peak / 1024**3:.2f} GiB"
+            )
             print(f"[DEBUG] Current PyTorch Memory: {current / 1024**3:.2f} GiB")
-            print(f"[DEBUG] GPU Memory Utilization Target: {config.gpu_memory_utilization}")
+            print(
+                f"[DEBUG] GPU Memory Utilization Target: {config.gpu_memory_utilization}"
+            )
 
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = (
@@ -142,7 +160,9 @@ class ModelRunner:
         )
 
         if self.rank == 0:
-            print(f"[DEBUG] Size of one KV cache block: {block_bytes / 1024**2:.2f} MiB")
+            print(
+                f"[DEBUG] Size of one KV cache block: {block_bytes / 1024**2:.2f} MiB"
+            )
 
         config.num_kvcache_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
@@ -152,7 +172,9 @@ class ModelRunner:
         if self.rank == 0:
             kv_cache_size_bytes = config.num_kvcache_blocks * block_bytes
             print(f"[DEBUG] Calculated num_kvcache_blocks: {config.num_kvcache_blocks}")
-            print(f"[DEBUG] Attempting to allocate KV cache of size: {kv_cache_size_bytes / 1024**3:.2f} GiB")
+            print(
+                f"[DEBUG] Attempting to allocate KV cache of size: {kv_cache_size_bytes / 1024**3:.2f} GiB"
+            )
             print("[DEBUG] --- End of allocate_kv_cache prints ---\n")
 
         assert config.num_kvcache_blocks > 0
