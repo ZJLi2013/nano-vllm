@@ -1,7 +1,7 @@
 import re
 import logging
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import torch
 from torch import nn
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 def load_model(model: nn.Module, model_path: str):
     """
-    Load model weights from checkpoint files.
+    Load model weights from safetensors checkpoint files.
 
     Args:
         model: The model instance to load weights into
@@ -33,32 +33,25 @@ def load_model(model: nn.Module, model_path: str):
             num_loaded_experts = model.model.layers[0].mlp.num_loaded_experts
             logger.info(f"Loading {num_loaded_experts} experts per MoE layer")
 
-    # Find checkpoint files
-    paths = sorted(list(Path(model_path).glob("*.safetensors")))
-    if not paths:
-        paths = sorted(list(Path(model_path).glob("*.bin")))
+    # Find safetensors checkpoint files
+    checkpoint_files = _find_safetensors_files(model_path)
 
-    if not paths:
-        raise FileNotFoundError(f"No checkpoint files found in {model_path}")
+    if not checkpoint_files:
+        raise FileNotFoundError(f"No safetensors files found in {model_path}")
 
-    # Prioritize consolidated/pytorch_model files
-    unsharded_paths = []
-    for p in paths:
-        if "consolidated" in p.name or "pytorch_model" in p.name:
-            unsharded_paths.append(p)
-
-    # If no consolidated files found, use all files
-    if not unsharded_paths:
-        unsharded_paths = paths
-
-    logger.info(f"Found {len(unsharded_paths)} checkpoint files")
+    logger.info(f"Found {len(checkpoint_files)} safetensors files")
 
     total_loaded = 0
     total_skipped = 0
 
-    for filepath in tqdm(unsharded_paths, desc="Loading weights"):
+    for filepath in tqdm(checkpoint_files, desc="Loading weights"):
         logger.debug(f"Loading weights from: {filepath}")
-        state_dict = torch.load(filepath, map_location="cpu")
+
+        try:
+            state_dict = _load_safetensors_file(filepath)
+        except Exception as e:
+            logger.error(f"Failed to load {filepath}: {e}")
+            continue
 
         for weight_name, weight_data in state_dict.items():
             # Skip expert weights if we're not loading all experts
@@ -95,9 +88,45 @@ def load_model(model: nn.Module, model_path: str):
     )
 
 
+def _find_safetensors_files(model_path: str) -> list[Path]:
+    """Find safetensors checkpoint files."""
+    safetensors_paths = sorted(list(Path(model_path).glob("*.safetensors")))
+
+    if not safetensors_paths:
+        return []
+
+    # Prioritize consolidated files
+    consolidated = [
+        p
+        for p in safetensors_paths
+        if "consolidated" in p.name or "pytorch_model" in p.name
+    ]
+    if consolidated:
+        return consolidated
+
+    return safetensors_paths
+
+
+def _load_safetensors_file(filepath: Path) -> Dict[str, torch.Tensor]:
+    """Load a safetensors file."""
+    try:
+        from safetensors import safe_open
+
+        state_dict = {}
+        with safe_open(filepath, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+        return state_dict
+    except ImportError:
+        raise ImportError("safetensors package is required but not installed")
+    except Exception as e:
+        logger.error(f"Failed to load safetensors file {filepath}: {e}")
+        raise
+
+
 def _map_weight_name(
     model: nn.Module, weight_name: str, num_loaded_experts: int
-) -> tuple[str | None, str | None]:
+) -> tuple[Optional[str], Optional[str]]:
     """
     Map checkpoint weight name to model parameter name.
 
@@ -205,7 +234,7 @@ def _load_weight(
 
 def _split_weight_for_tp(
     param_name: str, weight_data: torch.Tensor, target_shape: torch.Size
-) -> torch.Tensor | None:
+) -> Optional[torch.Tensor]:
     """Split weights for tensor parallelism."""
     if "qkv_proj" in param_name:
         wq, wk, wv = torch.chunk(weight_data, 3, dim=0)
