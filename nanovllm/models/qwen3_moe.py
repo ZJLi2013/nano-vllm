@@ -195,8 +195,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             param.data[expert_id].copy_(weight_shard)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_states_flat = hidden_states.view(-1, hidden_dim)
+        # Handle both 2D and 3D input shapes
+        if hidden_states.dim() == 3:
+            batch_size, seq_len, hidden_dim = hidden_states.shape
+            hidden_states_flat = hidden_states.view(-1, hidden_dim)
+            original_shape = (batch_size, seq_len, hidden_dim)
+        else:
+            # Already flattened: [num_tokens, hidden_dim]
+            hidden_states_flat = hidden_states
+            original_shape = hidden_states.shape
 
         # 1. Routing computation
         router_logits = self.gate(hidden_states_flat)  # [num_tokens, num_experts]
@@ -258,7 +265,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             dist.all_gather(gathered_outputs, final_hidden_states)
             final_hidden_states = torch.cat(gathered_outputs, dim=0)
 
-        return final_hidden_states.view(batch_size, seq_len, hidden_dim)
+        # Reshape back to original shape
+        if len(original_shape) == 3:
+            return final_hidden_states.view(original_shape)
+        else:
+            return final_hidden_states
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
