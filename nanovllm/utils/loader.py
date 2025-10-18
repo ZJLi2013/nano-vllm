@@ -1,12 +1,25 @@
 import re
+import logging
 from pathlib import Path
+from typing import Dict, Any
 
 import torch
 from torch import nn
 from tqdm import tqdm
 
+logger = logging.getLogger(__name__)
+
 
 def load_model(model: nn.Module, model_path: str):
+    """
+    Load model weights from checkpoint files.
+
+    Args:
+        model: The model instance to load weights into
+        model_path: Path to directory containing model checkpoint files
+    """
+    logger.info(f"Loading model weights from: {model_path}")
+
     # Get the number of loaded experts from the model config, if it exists
     num_loaded_experts = -1
     if (
@@ -18,114 +31,195 @@ def load_model(model: nn.Module, model_path: str):
             model.model.layers[0].mlp, "num_loaded_experts"
         ):
             num_loaded_experts = model.model.layers[0].mlp.num_loaded_experts
+            logger.info(f"Loading {num_loaded_experts} experts per MoE layer")
 
+    # Find checkpoint files
     paths = sorted(list(Path(model_path).glob("*.safetensors")))
     if not paths:
         paths = sorted(list(Path(model_path).glob("*.bin")))
-    unsharded_path = []
+
+    if not paths:
+        raise FileNotFoundError(f"No checkpoint files found in {model_path}")
+
+    # Prioritize consolidated/pytorch_model files
+    unsharded_paths = []
     for p in paths:
         if "consolidated" in p.name or "pytorch_model" in p.name:
-            unsharded_path.append(p)
+            unsharded_paths.append(p)
 
-    for filepath in tqdm(unsharded_path):
+    # If no consolidated files found, use all files
+    if not unsharded_paths:
+        unsharded_paths = paths
+
+    logger.info(f"Found {len(unsharded_paths)} checkpoint files")
+
+    total_loaded = 0
+    total_skipped = 0
+
+    for filepath in tqdm(unsharded_paths, desc="Loading weights"):
+        logger.debug(f"Loading weights from: {filepath}")
         state_dict = torch.load(filepath, map_location="cpu", mmap=True)
+
         for weight_name, weight_data in state_dict.items():
-            # Check if the weight belongs to an expert we are not loading
+            # Skip expert weights if we're not loading all experts
             if num_loaded_experts != -1:
                 match = re.search(r"experts\.([0-9]+)\.", weight_name)
                 if match:
                     expert_idx = int(match.group(1))
                     if expert_idx >= num_loaded_experts:
-                        continue  # Skip this weight
-
-            # Handle expert weights first
-            is_expert_weight = False
-            expert_id = None
-
-            # Check if this is an expert weight
-            match = re.search(r"experts\.([0-9]+)\.", weight_name)
-            if match:
-                expert_id = int(match.group(1))
-                is_expert_weight = True
-
-                # Check if we should skip this expert
-                if num_loaded_experts != -1 and expert_id >= num_loaded_experts:
-                    continue
-
-            # Try to map the weight using packed_modules_mapping
-            name = weight_name
-            shard_id = None
-
-            for packed_name, (
-                saved_name,
-                shard_id,
-            ) in model.packed_modules_mapping.items():
-                if saved_name not in weight_name:
-                    continue
-
-                # Handle expert weights
-                if is_expert_weight and "experts" in saved_name:
-                    # Build the target parameter name
-                    name = weight_name.replace(
-                        f"experts.{expert_id}.{saved_name}", f"{packed_name}"
-                    )
-                    # Set shard_id for expert weight loading
-                    shard_id = f"expert_{expert_id}"
-                    break
-                elif not is_expert_weight:
-                    # Handle regular weights
-                    if isinstance(shard_id, int):
-                        name = weight_name.replace(
-                            saved_name, f"{packed_name}.{shard_id}"
-                        )
-                    else:
-                        name = weight_name.replace(
-                            saved_name, f"{packed_name}.{shard_id}"
-                        )
-                    break
-            else:
-                # No mapping found, use original name
-                name = weight_name
-
-            # Skip layers that don't exist
-            match = re.match(r"model\.layers\.(\d+)\.", name)
-            if match:
-                layer_idx = int(match.group(1))
-                if (
-                    hasattr(model, "model")
-                    and hasattr(model.model, "layers")
-                    and isinstance(model.model.layers, nn.ModuleList)
-                ):
-                    if layer_idx >= len(model.model.layers):
+                        total_skipped += 1
                         continue
 
-            # Get the parameter and handle weight loading
-            try:
-                param = model.get_parameter(name)
+            # Map weight name to model parameter name
+            mapped_name, shard_id = _map_weight_name(
+                model, weight_name, num_loaded_experts
+            )
 
-                # Handle weight splitting for TP
-                if param.shape != weight_data.shape:
-                    if "qkv_proj" in name:
-                        wq, wk, wv = torch.chunk(weight_data, 3, dim=0)
-                        if "qkv_proj.q" in name:
-                            weight_data = wq
-                        elif "qkv_proj.k" in name:
-                            weight_data = wk
-                        elif "qkv_proj.v" in name:
-                            weight_data = wv
-                    elif "gate_up_proj" in name:
-                        w_gate, w_up = torch.chunk(weight_data, 2, dim=0)
-                        if "gate_up_proj.0" in name:
-                            weight_data = w_gate
-                        elif "gate_up_proj.1" in name:
-                            weight_data = w_up
-
-                # Use custom weight loader if available
-                if hasattr(param, "weight_loader") and shard_id is not None:
-                    param.weight_loader(param, weight_data, shard_id)
-                else:
-                    param.copy_(weight_data)
-
-            except AttributeError:
-                # Parameter not found, skip it
+            if mapped_name is None:
+                total_skipped += 1
                 continue
+
+            # Skip layers that don't exist
+            if _should_skip_layer(model, mapped_name):
+                total_skipped += 1
+                continue
+
+            # Load the weight
+            if _load_weight(model, mapped_name, weight_data, shard_id):
+                total_loaded += 1
+            else:
+                total_skipped += 1
+
+    logger.info(
+        f"Weight loading complete: {total_loaded} loaded, {total_skipped} skipped"
+    )
+
+
+def _map_weight_name(
+    model: nn.Module, weight_name: str, num_loaded_experts: int
+) -> tuple[str | None, str | None]:
+    """
+    Map checkpoint weight name to model parameter name.
+
+    Returns:
+        Tuple of (mapped_name, shard_id) or (None, None) if should be skipped
+    """
+    # Handle expert weights first
+    is_expert_weight = False
+    expert_id = None
+
+    # Check if this is an expert weight
+    match = re.search(r"experts\.([0-9]+)\.", weight_name)
+    if match:
+        expert_id = int(match.group(1))
+        is_expert_weight = True
+
+        # Check if we should skip this expert
+        if num_loaded_experts != -1 and expert_id >= num_loaded_experts:
+            return None, None
+
+    # Try to map the weight using packed_modules_mapping
+    name = weight_name
+    shard_id = None
+
+    if hasattr(model, "packed_modules_mapping"):
+        for packed_name, (
+            saved_name,
+            shard_info,
+        ) in model.packed_modules_mapping.items():
+            if saved_name not in weight_name:
+                continue
+
+            # Handle expert weights
+            if is_expert_weight and "experts" in saved_name:
+                # Build the target parameter name
+                name = weight_name.replace(
+                    f"experts.{expert_id}.{saved_name}", f"{packed_name}"
+                )
+                # Set shard_id for expert weight loading
+                shard_id = f"expert_{expert_id}"
+                break
+            elif not is_expert_weight:
+                # Handle regular weights
+                if isinstance(shard_info, int):
+                    name = weight_name.replace(
+                        saved_name, f"{packed_name}.{shard_info}"
+                    )
+                    shard_id = shard_info
+                else:
+                    name = weight_name.replace(
+                        saved_name, f"{packed_name}.{shard_info}"
+                    )
+                    shard_id = shard_info
+                break
+
+    return name, shard_id
+
+
+def _should_skip_layer(model: nn.Module, param_name: str) -> bool:
+    """Check if a parameter should be skipped because the layer doesn't exist."""
+    match = re.match(r"model\.layers\.(\d+)\.", param_name)
+    if match:
+        layer_idx = int(match.group(1))
+        if (
+            hasattr(model, "model")
+            and hasattr(model.model, "layers")
+            and isinstance(model.model.layers, nn.ModuleList)
+        ):
+            if layer_idx >= len(model.model.layers):
+                logger.debug(
+                    f"Skipping parameter {param_name} - layer {layer_idx} doesn't exist"
+                )
+                return True
+    return False
+
+
+def _load_weight(
+    model: nn.Module, param_name: str, weight_data: torch.Tensor, shard_id: Any
+) -> bool:
+    """Load a single weight into the model."""
+    try:
+        param = model.get_parameter(param_name)
+
+        # Handle weight splitting for tensor parallelism
+        if param.shape != weight_data.shape:
+            weight_data = _split_weight_for_tp(param_name, weight_data, param.shape)
+            if weight_data is None:
+                logger.warning(
+                    f"Shape mismatch for {param_name}: expected {param.shape}, got {weight_data.shape}"
+                )
+                return False
+
+        # Use custom weight loader if available
+        if hasattr(param, "weight_loader") and shard_id is not None:
+            param.weight_loader(param, weight_data, shard_id)
+        else:
+            param.copy_(weight_data)
+
+        return True
+
+    except AttributeError:
+        logger.debug(f"Parameter not found: {param_name}")
+        return False
+
+
+def _split_weight_for_tp(
+    param_name: str, weight_data: torch.Tensor, target_shape: torch.Size
+) -> torch.Tensor | None:
+    """Split weights for tensor parallelism."""
+    if "qkv_proj" in param_name:
+        wq, wk, wv = torch.chunk(weight_data, 3, dim=0)
+        if "qkv_proj.q" in param_name:
+            return wq
+        elif "qkv_proj.k" in param_name:
+            return wk
+        elif "qkv_proj.v" in param_name:
+            return wv
+    elif "gate_up_proj" in param_name:
+        w_gate, w_up = torch.chunk(weight_data, 2, dim=0)
+        if "gate_up_proj.0" in param_name:
+            return w_gate
+        elif "gate_up_proj.1" in param_name:
+            return w_up
+
+    return None
