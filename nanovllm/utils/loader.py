@@ -223,7 +223,7 @@ def _load_weight(
         if hasattr(param, "weight_loader") and shard_id is not None:
             param.weight_loader(param, weight_data, shard_id)
         else:
-            param.copy_(weight_data)
+            param.data.copy_(weight_data)
 
         return True
 
