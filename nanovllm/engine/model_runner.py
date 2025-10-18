@@ -13,9 +13,10 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 MODEL_REGISTRY = {
-    'Qwen3ForCausalLM': Qwen3ForCausalLM,
-    'Qwen3MoeForCausalLM': Qwen3MoeForCausalLM,
+    "Qwen3ForCausalLM": Qwen3ForCausalLM,
+    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
 }
+
 
 class ModelRunner:
 
@@ -120,6 +121,16 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        if self.rank == 0:
+            print("\n[DEBUG] --- Inside allocate_kv_cache ---")
+            print(f"[DEBUG] Total GPU Memory: {total / 1024**3:.2f} GiB")
+            print(f"[DEBUG] Free GPU Memory: {free / 1024**3:.2f} GiB")
+            print(f"[DEBUG] Used GPU Memory (by everything): {used / 1024**3:.2f} GiB")
+            print(f"[DEBUG] Peak PyTorch Memory (during load): {peak / 1024**3:.2f} GiB")
+            print(f"[DEBUG] Current PyTorch Memory: {current / 1024**3:.2f} GiB")
+            print(f"[DEBUG] GPU Memory Utilization Target: {config.gpu_memory_utilization}")
+
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = (
             2
@@ -129,10 +140,21 @@ class ModelRunner:
             * hf_config.head_dim
             * hf_config.torch_dtype.itemsize
         )
+
+        if self.rank == 0:
+            print(f"[DEBUG] Size of one KV cache block: {block_bytes / 1024**2:.2f} MiB")
+
         config.num_kvcache_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
             // block_bytes
         )
+
+        if self.rank == 0:
+            kv_cache_size_bytes = config.num_kvcache_blocks * block_bytes
+            print(f"[DEBUG] Calculated num_kvcache_blocks: {config.num_kvcache_blocks}")
+            print(f"[DEBUG] Attempting to allocate KV cache of size: {kv_cache_size_bytes / 1024**3:.2f} GiB")
+            print("[DEBUG] --- End of allocate_kv_cache prints ---\n")
+
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(
             2,

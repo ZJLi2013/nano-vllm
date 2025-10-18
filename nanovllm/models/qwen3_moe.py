@@ -14,27 +14,26 @@ Qwen3MoEAttention = Qwen3Attention
 class Qwen3MoEMLP(nn.Module):
     def __init__(
         self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        num_experts: int,
-        num_experts_per_tok: int,
+        config: Qwen3Config,
     ) -> None:
         super().__init__()
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_experts = num_experts
-        self.top_k = num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.total_num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        
+        # moe_experts_to_load is attached to the hf_config in the engine
+        self.num_loaded_experts = getattr(config, 'moe_experts_to_load', self.total_num_experts)
 
-        self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        self.router = nn.Linear(self.hidden_size, self.total_num_experts, bias=False)
         self.experts = nn.ModuleList(
             [
                 Qwen3MLP(
                     hidden_size=self.hidden_size,
                     intermediate_size=self.intermediate_size,
-                    hidden_act=hidden_act,
+                    hidden_act=config.hidden_act,
                 )
-                for _ in range(self.num_experts)
+                for _ in range(self.num_loaded_experts)
             ]
         )
 
@@ -46,27 +45,31 @@ class Qwen3MoEMLP(nn.Module):
         routing_weights, selected_experts = torch.topk(
             F.softmax(router_logits, dim=1, dtype=torch.float), self.top_k, dim=-1
         )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+        expert_mask = selected_experts < self.num_loaded_experts
+        
+        routing_weights = routing_weights * expert_mask
+        routing_weights_sum = routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights_sum[routing_weights_sum == 0] = 1.0
+        routing_weights = routing_weights / routing_weights_sum
+        
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = torch.zeros_like(hidden_states_flat)
         
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        for expert_idx in range(self.num_loaded_experts):
+            expert_layer = self.experts[expert_idx]
+            token_indices, topk_ids = torch.where(selected_experts == expert_idx)
 
-        for expert_idx in range(self.num_experts):
-            expert = self.experts[expert_idx]
-            token_indices, top_k_indices = torch.where(expert_mask[expert_idx])
-
-            if token_indices.shape[0] == 0:
+            if token_indices.numel() == 0:
                 continue
 
-            selected_tokens = hidden_states_flat[token_indices]
-            selected_weights = routing_weights[token_indices, top_k_indices, None]
+            current_routing_weights = routing_weights[token_indices, topk_ids, None]
+            current_hidden_states = hidden_states_flat[token_indices]
 
-            expert_output = expert(selected_tokens)
-            weighted_output = expert_output * selected_weights
-
-            final_hidden_states.index_add_(0, token_indices, weighted_output.to(hidden_states.dtype))
+            expert_output = expert_layer(current_hidden_states)
+            weighted_output = expert_output * current_routing_weights
+            final_hidden_states.index_add_(0, token_indices, weighted_output)
 
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_size)
 
@@ -89,15 +92,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        self.mlp = Qwen3MoEMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            num_experts=config.num_experts,
-            num_experts_per_tok=config.num_experts_per_tok,
-        )
+        self.mlp = Qwen3MoEMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -122,8 +121,12 @@ class Qwen3MoeModel(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3MoeDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size
+        )
+        self.layers = nn.ModuleList(
+            [Qwen3MoeDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -150,10 +153,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(
-        self,
-        config: Qwen3Config
-    ) -> None:
+    def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.model = Qwen3MoeModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
