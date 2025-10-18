@@ -215,6 +215,7 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        print(f"[DEBUG prepare_prefill] Starting with {len(seqs)} sequences")
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -223,8 +224,13 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
-        for seq in seqs:
+
+        print(f"[DEBUG prepare_prefill] Processing sequences...")
+        for seq_idx, seq in enumerate(seqs):
             seqlen = len(seq)
+            print(
+                f"[DEBUG prepare_prefill] Sequence {seq_idx}: length={seqlen}, num_cached_tokens={seq.num_cached_tokens}"
+            )
             input_ids.extend(
                 seq[seq.num_cached_tokens :]
             )  # 只考虑 non-cached 部分的 seq 作为 input_ids
@@ -252,8 +258,14 @@ class ModelRunner:
             """
                 slot_mapping, 每个 seq 需要存储 kvcache 的 tokens 区间上 每个 token 的 start/end_block_id; 并在 batch 上平铺
             """
+        print(
+            f"[DEBUG prepare_prefill] Total input_ids: {len(input_ids)}, positions: {len(positions)}"
+        )
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
+            print(f"[DEBUG prepare_prefill] Creating block tables")
             block_tables = self.prepare_block_tables(seqs)
+
+        print(f"[DEBUG prepare_prefill] Creating tensors...")
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
@@ -269,6 +281,8 @@ class ModelRunner:
         slot_mapping = torch.tensor(
             slot_mapping, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+
+        print(f"[DEBUG prepare_prefill] Setting context...")
         set_context(
             True,
             cu_seqlens_q,
@@ -279,6 +293,7 @@ class ModelRunner:
             None,
             block_tables,
         )
+        print(f"[DEBUG prepare_prefill] Completed")
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -362,15 +377,26 @@ class ModelRunner:
             """
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        print(
+            f"[DEBUG run] Starting run with {len(seqs)} sequences, is_prefill={is_prefill}"
+        )
+        print(f"[DEBUG run] Calling prepare_prefill/prepare_decode")
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         )
+        print(
+            f"[DEBUG run] Input IDs shape: {input_ids.shape}, Positions shape: {positions.shape}"
+        )
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        print(f"[DEBUG run] Calling run_model")
         logits = self.run_model(input_ids, positions, is_prefill)
+        print(f"[DEBUG run] Logits shape: {logits.shape}")
         token_ids = (
             self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         )  # logits 采样 作为最终输出 tokens
+        print(f"[DEBUG run] Token IDs: {token_ids}")
         reset_context()
+        print(f"[DEBUG run] Run completed")
         return token_ids
 
     @torch.inference_mode()
