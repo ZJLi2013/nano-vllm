@@ -19,6 +19,8 @@ def load_model(model: nn.Module, model_path: str):
         model_path: Path to directory containing model checkpoint files
     """
     logger.info(f"Loading model weights from: {model_path}")
+    # Enable debug logging to see weight loading details
+    logger.setLevel(logging.DEBUG)
 
     # Get the number of loaded experts from the model config, if it exists
     num_loaded_experts = -1
@@ -81,6 +83,7 @@ def load_model(model: nn.Module, model_path: str):
             if _load_weight(model, mapped_name, weight_data, shard_id):
                 total_loaded += 1
             else:
+                logger.warning(f"Failed to load weight: {weight_name} -> {mapped_name}")
                 total_skipped += 1
 
     logger.info(

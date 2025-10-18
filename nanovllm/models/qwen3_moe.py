@@ -134,21 +134,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.tp_size = dist.get_world_size()
         self.tp_rank = dist.get_rank()
 
-        # Use single large tensors to store all expert weights
-        # gate_up_weights: [num_experts, 2 * intermediate_size, hidden_size]
-        # down_weights: [num_experts, hidden_size, intermediate_size]
+        # FIXED: Correct weight tensor shapes
+        # gate_up_weights: [num_experts, hidden_size, 2 * intermediate_size/tp]
+        # down_weights: [num_experts, intermediate_size/tp, hidden_size]
         self.gate_up_weights = nn.Parameter(
             torch.empty(
                 self.total_num_experts,
+                self.hidden_size,  # Correct dimension order
                 2 * self.intermediate_size // self.tp_size,
-                self.hidden_size,
             )
         )
         self.down_weights = nn.Parameter(
             torch.empty(
                 self.total_num_experts,
+                self.intermediate_size // self.tp_size,  # Correct dimension order
                 self.hidden_size,
-                self.intermediate_size // self.tp_size,
             )
         )
 
@@ -169,29 +169,35 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def gate_up_weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
     ):
-        """Load gate_up expert weights"""
-        # loaded_weight: [2 * intermediate_size, hidden_size]
+        """Load gate_up expert weights with proper TP handling"""
+        # loaded_weight: [hidden_size, 2 * intermediate_size]
         # loaded_shard_id format: "expert_{expert_id}"
         if loaded_shard_id.startswith("expert_"):
             expert_id = int(loaded_shard_id.split("_")[1])
-            # Split by TP
-            shard_size = loaded_weight.size(0) // self.tp_size
+
+            # Split by TP along the output dimension (dim=1)
+            shard_size = loaded_weight.size(1) // self.tp_size
             start_idx = self.tp_rank * shard_size
-            weight_shard = loaded_weight.narrow(0, start_idx, shard_size)
+            weight_shard = loaded_weight.narrow(1, start_idx, shard_size)
+
+            # Copy to the correct expert and shard
             param.data[expert_id].copy_(weight_shard)
 
     def down_weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
     ):
-        """Load down expert weights"""
-        # loaded_weight: [hidden_size, intermediate_size]
+        """Load down expert weights with proper TP handling"""
+        # loaded_weight: [intermediate_size, hidden_size]
         # loaded_shard_id format: "expert_{expert_id}"
         if loaded_shard_id.startswith("expert_"):
             expert_id = int(loaded_shard_id.split("_")[1])
-            # Split columns by TP
-            shard_size = loaded_weight.size(1) // self.tp_size
+
+            # Split by TP along the input dimension (dim=0)
+            shard_size = loaded_weight.size(0) // self.tp_size
             start_idx = self.tp_rank * shard_size
-            weight_shard = loaded_weight.narrow(1, start_idx, shard_size)
+            weight_shard = loaded_weight.narrow(0, start_idx, shard_size)
+
+            # Copy to the correct expert and shard
             param.data[expert_id].copy_(weight_shard)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -236,34 +242,39 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 if expert_idx >= self.total_num_experts:
                     continue
 
-                # Compute expert output - using nano-vllm's parallel linear layers
+                # FIXED: Correct expert computation with proper weight shapes
                 # gate_up computation
                 gate_up_output = F.linear(
                     token_hidden,
-                    self.gate_up_weights[expert_idx],  # [2*inter_size/tp, hidden_dim]
+                    self.gate_up_weights[expert_idx],  # [hidden_size, 2*inter_size/tp]
                 )  # [2*inter_size/tp]
 
-                # Use SiluAndMul activation function
-                activated = self.act_fn(gate_up_output)  # [inter_size/tp]
+                # Split gate and up projections
+                gate, up = torch.chunk(gate_up_output, 2, dim=-1)
+
+                # Use SiGLU activation: SiLU(gate) * up
+                activated = self.act_fn(gate) * up  # [inter_size/tp]
 
                 # down projection
                 expert_output = F.linear(
                     activated,
-                    self.down_weights[expert_idx],  # [hidden_dim, inter_size/tp]
+                    self.down_weights[expert_idx],  # [inter_size/tp, hidden_size]
                 )  # [hidden_dim]
 
                 token_output += expert_output * weight
 
             final_hidden_states[token_idx] = token_output
 
-        # 5. TP all_gather
+        # FIXED: Correct TP all_gather - concatenate along hidden dimension
         if self.tp_size > 1:
             # Gather results across all TP ranks
             gathered_outputs = [
                 torch.zeros_like(final_hidden_states) for _ in range(self.tp_size)
             ]
             dist.all_gather(gathered_outputs, final_hidden_states)
-            final_hidden_states = torch.cat(gathered_outputs, dim=0)
+            final_hidden_states = torch.cat(
+                gathered_outputs, dim=-1
+            )  # Concatenate along hidden dim
 
         # Reshape back to original shape
         if len(original_shape) == 3:
@@ -357,6 +368,7 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(nn.Module):
+    # FIXED: Updated packed_modules_mapping to handle expert weights properly
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
