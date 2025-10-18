@@ -370,14 +370,14 @@ class Qwen3MoeModel(nn.Module):
 class Qwen3MoeForCausalLM(nn.Module):
     # FIXED: Updated packed_modules_mapping to handle expert weights properly
     packed_modules_mapping = {
+        "experts.gate_proj": ("gate_up_weights", "expert"),
+        "experts.up_proj": ("gate_up_weights", "expert"),
+        "experts.down_proj": ("down_weights", "expert"),
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
-        "mlp.experts.gate_proj": ("mlp.gate_up_weights", "expert"),
-        "mlp.experts.up_proj": ("mlp.gate_up_weights", "expert"),
-        "mlp.experts.down_proj": ("mlp.down_weights", "expert"),
     }
 
     def __init__(self, config: Qwen3Config) -> None:
