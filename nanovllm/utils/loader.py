@@ -38,6 +38,24 @@ def load_model(model: nn.Module, model_path: str):
                     if expert_idx >= num_loaded_experts:
                         continue  # Skip this weight
 
+            # Handle expert weights first
+            is_expert_weight = False
+            expert_id = None
+
+            # Check if this is an expert weight
+            match = re.search(r"experts\.([0-9]+)\.", weight_name)
+            if match:
+                expert_id = int(match.group(1))
+                is_expert_weight = True
+
+                # Check if we should skip this expert
+                if num_loaded_experts != -1 and expert_id >= num_loaded_experts:
+                    continue
+
+            # Try to map the weight using packed_modules_mapping
+            name = weight_name
+            shard_id = None
+
             for packed_name, (
                 saved_name,
                 shard_id,
@@ -45,21 +63,17 @@ def load_model(model: nn.Module, model_path: str):
                 if saved_name not in weight_name:
                     continue
 
-                # 处理专家权重映射
-                if "experts" in saved_name and shard_id == "expert":
-                    # 提取专家ID
-                    match = re.search(r"experts\.([0-9]+)\.", weight_name)
-                    if match:
-                        expert_id = int(match.group(1))
-                        # 构建新的权重名称
-                        name = weight_name.replace(
-                            f"experts.{expert_id}.{saved_name}", f"{packed_name}"
-                        )
-                        # 设置 shard_id 为 expert_{id} 格式
-                        shard_id = f"expert_{expert_id}"
-                        break
-                else:
-                    # 普通权重映射
+                # Handle expert weights
+                if is_expert_weight and "experts" in saved_name:
+                    # Build the target parameter name
+                    name = weight_name.replace(
+                        f"experts.{expert_id}.{saved_name}", f"{packed_name}"
+                    )
+                    # Set shard_id for expert weight loading
+                    shard_id = f"expert_{expert_id}"
+                    break
+                elif not is_expert_weight:
+                    # Handle regular weights
                     if isinstance(shard_id, int):
                         name = weight_name.replace(
                             saved_name, f"{packed_name}.{shard_id}"
@@ -70,8 +84,10 @@ def load_model(model: nn.Module, model_path: str):
                         )
                     break
             else:
+                # No mapping found, use original name
                 name = weight_name
 
+            # Skip layers that don't exist
             match = re.match(r"model\.layers\.(\d+)\.", name)
             if match:
                 layer_idx = int(match.group(1))
@@ -83,20 +99,33 @@ def load_model(model: nn.Module, model_path: str):
                     if layer_idx >= len(model.model.layers):
                         continue
 
-            param = model.get_parameter(name)
-            if param.shape != weight_data.shape:
-                if "qkv_proj" in name:
-                    wq, wk, wv = torch.chunk(weight_data, 3, dim=0)
-                    if "qkv_proj.q" in name:
-                        weight_data = wq
-                    elif "qkv_proj.k" in name:
-                        weight_data = wk
-                    elif "qkv_proj.v" in name:
-                        weight_data = wv
-                elif "gate_up_proj" in name:
-                    w_gate, w_up = torch.chunk(weight_data, 2, dim=0)
-                    if "gate_up_proj.0" in name:
-                        weight_data = w_gate
-                    elif "gate_up_proj.1" in name:
-                        weight_data = w_up
-            param.copy_(weight_data)
+            # Get the parameter and handle weight loading
+            try:
+                param = model.get_parameter(name)
+
+                # Handle weight splitting for TP
+                if param.shape != weight_data.shape:
+                    if "qkv_proj" in name:
+                        wq, wk, wv = torch.chunk(weight_data, 3, dim=0)
+                        if "qkv_proj.q" in name:
+                            weight_data = wq
+                        elif "qkv_proj.k" in name:
+                            weight_data = wk
+                        elif "qkv_proj.v" in name:
+                            weight_data = wv
+                    elif "gate_up_proj" in name:
+                        w_gate, w_up = torch.chunk(weight_data, 2, dim=0)
+                        if "gate_up_proj.0" in name:
+                            weight_data = w_gate
+                        elif "gate_up_proj.1" in name:
+                            weight_data = w_up
+
+                # Use custom weight loader if available
+                if hasattr(param, "weight_loader") and shard_id is not None:
+                    param.weight_loader(param, weight_data, shard_id)
+                else:
+                    param.copy_(weight_data)
+
+            except AttributeError:
+                # Parameter not found, skip it
+                continue
