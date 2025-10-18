@@ -4,7 +4,8 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-import flash_infer
+
+# import flash_infer
 from nanovllm.utils.context import get_context
 
 
@@ -89,21 +90,24 @@ class Attention(nn.Module):
                 cu_seqlens_k=context.cu_seqlens_k,
                 softmax_scale=self.scale,
                 causal=True,
-                window_size=(-1, 0) if self.window_size is None else (self.window_size, 0),
+                window_size=(
+                    (-1, 0) if self.window_size is None else (self.window_size, 0)
+                ),
                 block_table=context.block_tables,
             )
         else:  # decode
             if self.window_size is not None:
-                o = flash_infer.single_decode_with_paged_kv_cache(
-                    q,
-                    k_cache,
-                    v_cache,
-                    context.block_tables,
-                    context.context_lens,
-                    self.window_size,
-                    softmax_scale=self.scale,
-                    causal=True,
-                )
+                # o = flash_infer.single_decode_with_paged_kv_cache(
+                #     q,
+                #     k_cache,
+                #     v_cache,
+                #     context.block_tables,
+                #     context.context_lens,
+                #     self.window_size,
+                #     softmax_scale=self.scale,
+                #     causal=True,
+                # )
+                pass
             else:
                 o = flash_attn_with_kvcache(
                     q.unsqueeze(1),

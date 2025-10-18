@@ -9,8 +9,14 @@ from tqdm import tqdm
 def load_model(model: nn.Module, model_path: str):
     # Get the number of loaded experts from the model config, if it exists
     num_loaded_experts = -1
-    if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
-        if hasattr(model.model.layers[0], "mlp") and hasattr(model.model.layers[0].mlp, "num_loaded_experts"):
+    if (
+        hasattr(model, "model")
+        and hasattr(model.model, "layers")
+        and len(model.model.layers) > 0
+    ):
+        if hasattr(model.model.layers[0], "mlp") and hasattr(
+            model.model.layers[0].mlp, "num_loaded_experts"
+        ):
             num_loaded_experts = model.model.layers[0].mlp.num_loaded_experts
 
     paths = sorted(list(Path(model_path).glob("*.safetensors")))
@@ -26,7 +32,7 @@ def load_model(model: nn.Module, model_path: str):
         for weight_name, weight_data in state_dict.items():
             # Check if the weight belongs to an expert we are not loading
             if num_loaded_experts != -1:
-                match = re.search(r'experts\.([0-9]+)\.', weight_name)
+                match = re.search(r"experts\.([0-9]+)\.", weight_name)
                 if match:
                     expert_idx = int(match.group(1))
                     if expert_idx >= num_loaded_experts:
@@ -38,11 +44,31 @@ def load_model(model: nn.Module, model_path: str):
             ) in model.packed_modules_mapping.items():
                 if saved_name not in weight_name:
                     continue
-                if isinstance(shard_id, int):
-                    name = weight_name.replace(saved_name, f"{packed_name}.{shard_id}")
+
+                # 处理专家权重映射
+                if "experts" in saved_name and shard_id == "expert":
+                    # 提取专家ID
+                    match = re.search(r"experts\.([0-9]+)\.", weight_name)
+                    if match:
+                        expert_id = int(match.group(1))
+                        # 构建新的权重名称
+                        name = weight_name.replace(
+                            f"experts.{expert_id}.{saved_name}", f"{packed_name}"
+                        )
+                        # 设置 shard_id 为 expert_{id} 格式
+                        shard_id = f"expert_{expert_id}"
+                        break
                 else:
-                    name = weight_name.replace(saved_name, f"{packed_name}.{shard_id}")
-                break
+                    # 普通权重映射
+                    if isinstance(shard_id, int):
+                        name = weight_name.replace(
+                            saved_name, f"{packed_name}.{shard_id}"
+                        )
+                    else:
+                        name = weight_name.replace(
+                            saved_name, f"{packed_name}.{shard_id}"
+                        )
+                    break
             else:
                 name = weight_name
 
