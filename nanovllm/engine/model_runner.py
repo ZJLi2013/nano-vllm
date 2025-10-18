@@ -115,6 +115,7 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
+        print(f"[DEBUG warmup_model] Starting warmup for rank {self.rank}")
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = (
@@ -124,9 +125,15 @@ class ModelRunner:
         num_seqs = min(
             max_num_batched_tokens // max_model_len, self.config.max_num_seqs
         )
+        print(
+            f"[DEBUG warmup_model] Creating {num_seqs} sequences of length {max_model_len}"
+        )
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        print(f"[DEBUG warmup_model] Calling run() with {len(seqs)} sequences")
         self.run(seqs, True)
+        print(f"[DEBUG warmup_model] Run completed, emptying cache")
         torch.cuda.empty_cache()
+        print(f"[DEBUG warmup_model] Warmup completed for rank {self.rank}")
 
     def allocate_kv_cache(self):
         config = self.config
