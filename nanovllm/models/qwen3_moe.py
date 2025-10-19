@@ -134,21 +134,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.tp_size = dist.get_world_size()
         self.tp_rank = dist.get_rank()
 
-        # FIXED: Correct weight tensor shapes
-        # gate_up_weights: [num_experts, hidden_size, 2 * intermediate_size/tp]
-        # down_weights: [num_experts, intermediate_size/tp, hidden_size]
+        # gate_up_weights: [num_experts, 2 * intermediate_size/tp, hidden_size]
+        # down_weights: [num_experts, hidden_size, intermediate_size/tp]
         self.gate_up_weights = nn.Parameter(
             torch.empty(
                 self.total_num_experts,
-                self.hidden_size,  # Correct dimension order
                 2 * self.intermediate_size // self.tp_size,
+                self.hidden_size,
             )
         )
         self.down_weights = nn.Parameter(
             torch.empty(
                 self.total_num_experts,
-                self.intermediate_size // self.tp_size,  # Correct dimension order
                 self.hidden_size,
+                self.intermediate_size // self.tp_size,
             )
         )
 
@@ -167,38 +166,54 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.act_fn = SiluAndMul()
 
     def gate_up_weight_loader(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+        shard_id: str,
     ):
-        """Load gate_up expert weights with proper TP handling"""
-        # loaded_weight: [hidden_size, 2 * intermediate_size]
-        # loaded_shard_id format: "expert_{expert_id}"
-        if loaded_shard_id.startswith("expert_"):
-            expert_id = int(loaded_shard_id.split("_")[1])
+        """Load gate_up expert weights with proper TP and shard handling."""
+        tp_rank = self.tp_rank
+        tp_size = self.tp_size
+        inter_size = self.intermediate_size
 
-            # Split by TP along the output dimension (dim=1)
-            shard_size = loaded_weight.size(1) // self.tp_size
-            start_idx = self.tp_rank * shard_size
-            weight_shard = loaded_weight.narrow(1, start_idx, shard_size)
+        # This is a MergedColumnParallelLinear, sharded on the output dimension (dim 0).
+        # The full weight for gate_proj or up_proj is [intermediate_size, hidden_size].
+        shard_size = inter_size // tp_size
+        start_row = tp_rank * shard_size
+        weight_shard = loaded_weight.narrow(0, start_row, shard_size)
 
-            # Copy to the correct expert and shard
-            param.data[expert_id].copy_(weight_shard)
+        # Copy into the correct slice of the expert's parameter.
+        if shard_id == "gate":
+            # First half of the rows in the expert's gate_up weight
+            param_slice = param.data[expert_id].narrow(0, 0, shard_size)
+        elif shard_id == "up":
+            # Second half of the rows
+            param_slice = param.data[expert_id].narrow(0, shard_size, shard_size)
+        else:
+            raise ValueError(f"Invalid shard_id {shard_id} for gate_up_weight_loader")
+        param_slice.copy_(weight_shard)
 
     def down_weight_loader(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+        shard_id: str,
     ):
-        """Load down expert weights with proper TP handling"""
-        # loaded_weight: [intermediate_size, hidden_size]
-        # loaded_shard_id format: "expert_{expert_id}"
-        if loaded_shard_id.startswith("expert_"):
-            expert_id = int(loaded_shard_id.split("_")[1])
+        """Load down expert weights with proper TP handling."""
+        tp_rank = self.tp_rank
+        tp_size = self.tp_size
+        inter_size = self.intermediate_size
 
-            # Split by TP along the input dimension (dim=0)
-            shard_size = loaded_weight.size(0) // self.tp_size
-            start_idx = self.tp_rank * shard_size
-            weight_shard = loaded_weight.narrow(0, start_idx, shard_size)
+        # This is a RowParallelLinear, sharded on the input dimension (dim 1).
+        # The full weight is [hidden_size, intermediate_size].
+        shard_size = inter_size // tp_size
+        start_col = tp_rank * shard_size
+        weight_shard = loaded_weight.narrow(1, start_col, shard_size)
 
-            # Copy to the correct expert and shard
-            param.data[expert_id].copy_(weight_shard)
+        # The parameter is already sharded for this TP rank, so we can copy directly.
+        param.data[expert_id].copy_(weight_shard)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Handle both 2D and 3D input shapes

@@ -35,12 +35,17 @@ def load_model(model: nn.Module, path: str):
                     param_name, expert_id, shard_id = expert_lookup[weight_name]
                     try:
                         param = model.get_parameter(param_name)
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
+                        # Experts must have a custom weight loader
+                        weight_loader = getattr(param, "weight_loader")
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            expert_id=expert_id,
+                            shard_id=shard_id,
                         )
-                        weight_loader(param, loaded_weight, f"expert_{expert_id}")
                         is_packed = True
                     except AttributeError:
+                        # This can happen if the expert is not loaded (subset of experts)
                         print(f"Skipping expert weight: {weight_name}")
                         continue
 
