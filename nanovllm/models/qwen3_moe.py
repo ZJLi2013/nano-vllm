@@ -264,11 +264,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                     self.gate_up_weights[expert_idx],  # [hidden_size, 2*inter_size/tp]
                 )  # [2*inter_size/tp]
 
-                # Split gate and up projections
-                gate, up = torch.chunk(gate_up_output, 2, dim=-1)
-
-                # Use SiGLU activation: SiLU(gate) * up
-                activated = self.act_fn(gate) * up  # [inter_size/tp]
+                # The SiluAndMul activation handles both chunking and activation
+                activated = self.act_fn(gate_up_output)
 
                 # down projection
                 expert_output = F.linear(
