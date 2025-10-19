@@ -21,7 +21,6 @@ MODEL_REGISTRY = {
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
-        print(f"[DEBUG ModelRunner] Starting initialization for rank {rank}")
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -30,11 +29,9 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        print(f"[DEBUG ModelRunner] Initializing process group for rank {rank}")
         dist.init_process_group(
             "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
         )
-        print(f"[DEBUG ModelRunner] Process group initialized for rank {rank}")
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -43,35 +40,24 @@ class ModelRunner:
         model_class = MODEL_REGISTRY.get(architecture)
         if model_class is None:
             raise ValueError(f"Unsupported model architecture: {architecture}")
-        print(f"[DEBUG ModelRunner] Creating model instance for rank {rank}")
         self.model = model_class(hf_config)
-        print(f"[DEBUG ModelRunner] Loading model weights for rank {rank}")
         load_model(self.model, config.model)
-        print(f"[DEBUG ModelRunner] Weights loaded for rank {rank}")
         self.sampler = Sampler()
-        print(f"[DEBUG ModelRunner] Warming up model for rank {rank}")
         self.warmup_model()
-        print(f"[DEBUG ModelRunner] Allocating KV cache for rank {rank}")
         self.allocate_kv_cache()
         if not self.enforce_eager:
-            print(f"[DEBUG ModelRunner] Capturing CUDA graphs for rank {rank}")
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
-                print(f"[DEBUG ModelRunner] Creating shared memory for rank {rank}")
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
-                print(f"[DEBUG ModelRunner] Rank {rank} passed barrier")
             else:
                 dist.barrier()
-                print(f"[DEBUG ModelRunner] Rank {rank} passed barrier")
                 self.shm = SharedMemory(name="nanovllm")
-                print(f"[DEBUG ModelRunner] Starting loop for rank {rank}")
                 self.loop()
-        print(f"[DEBUG ModelRunner] Initialization completed for rank {rank}")
 
     def exit(self):
         if self.world_size > 1:
@@ -115,7 +101,6 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
-        print(f"[DEBUG warmup_model] Starting warmup for rank {self.rank}")
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
@@ -123,15 +108,9 @@ class ModelRunner:
         warmup_seq_len = min(512, self.config.max_model_len)
         warmup_num_seqs = min(2, self.config.max_num_seqs)
 
-        print(
-            f"[DEBUG warmup_model] Creating {warmup_num_seqs} sequences of length {warmup_seq_len}"
-        )
         seqs = [Sequence([0] * warmup_seq_len) for _ in range(warmup_num_seqs)]
-        print(f"[DEBUG warmup_model] Calling run() with {len(seqs)} sequences")
         self.run(seqs, True)
-        print(f"[DEBUG warmup_model] Run completed, emptying cache")
         torch.cuda.empty_cache()
-        print(f"[DEBUG warmup_model] Warmup completed for rank {self.rank}")
 
     def allocate_kv_cache(self):
         config = self.config
@@ -140,19 +119,6 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-
-        if self.rank == 0:
-            print("\n[DEBUG] --- Inside allocate_kv_cache ---")
-            print(f"[DEBUG] Total GPU Memory: {total / 1024**3:.2f} GiB")
-            print(f"[DEBUG] Free GPU Memory: {free / 1024**3:.2f} GiB")
-            print(f"[DEBUG] Used GPU Memory (by everything): {used / 1024**3:.2f} GiB")
-            print(
-                f"[DEBUG] Peak PyTorch Memory (during load): {peak / 1024**3:.2f} GiB"
-            )
-            print(f"[DEBUG] Current PyTorch Memory: {current / 1024**3:.2f} GiB")
-            print(
-                f"[DEBUG] GPU Memory Utilization Target: {config.gpu_memory_utilization}"
-            )
 
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = (
@@ -164,23 +130,10 @@ class ModelRunner:
             * hf_config.torch_dtype.itemsize
         )
 
-        if self.rank == 0:
-            print(
-                f"[DEBUG] Size of one KV cache block: {block_bytes / 1024**2:.2f} MiB"
-            )
-
         config.num_kvcache_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
             // block_bytes
         )
-
-        if self.rank == 0:
-            kv_cache_size_bytes = config.num_kvcache_blocks * block_bytes
-            print(f"[DEBUG] Calculated num_kvcache_blocks: {config.num_kvcache_blocks}")
-            print(
-                f"[DEBUG] Attempting to allocate KV cache of size: {kv_cache_size_bytes / 1024**3:.2f} GiB"
-            )
-            print("[DEBUG] --- End of allocate_kv_cache prints ---\\n")
 
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(
@@ -213,7 +166,6 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
-        print(f"[DEBUG prepare_prefill] Starting with {len(seqs)} sequences")
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -223,12 +175,8 @@ class ModelRunner:
         slot_mapping_list = []
         block_tables = None
 
-        print(f"[DEBUG prepare_prefill] Processing sequences...")
         for seq_idx, seq in enumerate(seqs):
             seqlen = len(seq)
-            print(
-                f"[DEBUG prepare_prefill] Sequence {seq_idx}: length={seqlen}, num_cached_tokens={seq.num_cached_tokens}"
-            )
             input_ids.extend(
                 seq[seq.num_cached_tokens :]
             )  # 只考虑 non-cached 部分的 seq 作为 input_ids
@@ -256,14 +204,9 @@ class ModelRunner:
             """
                 slot_mapping, 每个 seq 需要存储 kvcache 的 tokens 区间上 每个 token 的 start/end_block_id; 并在 batch 上平铺
             """
-        print(
-            f"[DEBUG prepare_prefill] Total input_ids: {len(input_ids)}, positions: {len(positions)}"
-        )
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
-            print(f"[DEBUG prepare_prefill] Creating block tables")
             block_tables = self.prepare_block_tables(seqs)
 
-        print(f"[DEBUG prepare_prefill] Creating tensors...")
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
@@ -281,7 +224,6 @@ class ModelRunner:
         else:
             slot_mapping = torch.empty(0, dtype=torch.int32).cuda(non_blocking=True)
 
-        print(f"[DEBUG prepare_prefill] Setting context...")
         set_context(
             True,
             cu_seqlens_q,
@@ -292,7 +234,6 @@ class ModelRunner:
             None,
             block_tables,
         )
-        print(f"[DEBUG prepare_prefill] Completed")
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -347,19 +288,13 @@ class ModelRunner:
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
     ):
-        print(
-            f"[DEBUG run_model] Starting with input_ids shape: {input_ids.shape}, is_prefill={is_prefill}"
-        )
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            print(f"[DEBUG run_model] Running prefill/eager mode")
             result = self.model.compute_logits(self.model(input_ids, positions))
-            print(f"[DEBUG run_model] Prefill completed, result shape: {result.shape}")
             return result
             """
                 Prefill 吐出首字
             """
         else:
-            print(f"[DEBUG run_model] Running decode mode with CUDA graphs")
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -378,33 +313,21 @@ class ModelRunner:
                 TODO: 
             """
             result = self.model.compute_logits(graph_vars["outputs"][:bs])
-            print(f"[DEBUG run_model] Decode completed, result shape: {result.shape}")
             return result
             """
                 decode 每计算一步，就转换一个 词表 token
             """
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        print(
-            f"[DEBUG run] Starting run with {len(seqs)} sequences, is_prefill={is_prefill}"
-        )
-        print(f"[DEBUG run] Calling prepare_prefill/prepare_decode")
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         )
-        print(
-            f"[DEBUG run] Input IDs shape: {input_ids.shape}, Positions shape: {positions.shape}"
-        )
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        print(f"[DEBUG run] Calling run_model")
         logits = self.run_model(input_ids, positions, is_prefill)
-        print(f"[DEBUG run] Logits shape: {logits.shape}")
         token_ids = (
             self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         )  # logits 采样 作为最终输出 tokens
-        print(f"[DEBUG run] Token IDs: {token_ids}")
         reset_context()
-        print(f"[DEBUG run] Run completed")
         return token_ids
 
     @torch.inference_mode()

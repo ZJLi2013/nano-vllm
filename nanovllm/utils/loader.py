@@ -44,7 +44,7 @@ def load_model(model: nn.Module, path: str):
                         )
                     except AttributeError:
                         # This can happen if the expert is not loaded (subset of experts)
-                        print(f"Skipping expert weight: {weight_name}")
+                        pass
                     continue  # Move to the next weight
 
                 # 2. Try to load as a dense packed-layer weight
@@ -63,7 +63,7 @@ def load_model(model: nn.Module, path: str):
                         weight_loader = getattr(param, "weight_loader")
                         weight_loader(param, loaded_weight, shard_info)
                     except AttributeError:
-                        print(f"Skipping packed weight: {weight_name}")
+                        pass
                     continue # Move to the next weight
 
                 # 3. Try to load as a default weight
@@ -74,4 +74,4 @@ def load_model(model: nn.Module, path: str):
                     )
                     weight_loader(param, loaded_weight)
                 except AttributeError:
-                    print(f"Skipping weight: {weight_name}")
+                    pass
