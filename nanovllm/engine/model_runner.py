@@ -180,7 +180,7 @@ class ModelRunner:
             print(
                 f"[DEBUG] Attempting to allocate KV cache of size: {kv_cache_size_bytes / 1024**3:.2f} GiB"
             )
-            print("[DEBUG] --- End of allocate_kv_cache prints ---\n")
+            print("[DEBUG] --- End of allocate_kv_cache prints ---\\n")
 
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(
@@ -220,7 +220,7 @@ class ModelRunner:
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
+        slot_mapping_list = []
         block_tables = None
 
         print(f"[DEBUG prepare_prefill] Processing sequences...")
@@ -238,7 +238,7 @@ class ModelRunner:
             seqlen_q = seqlen - seq.num_cached_tokens  # non-cache 部分的 seq 也即  sl_q
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            """"
+            """
                 cu_seqlens_q = [0, slq, 2*slq, ..]，即 batch 中 seqlen_q 以 checksum 形式的 平铺
             """
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -252,7 +252,7 @@ class ModelRunner:
                     end = start + self.block_size
                 else:
                     end = start + seq.last_block_num_tokens
-                slot_mapping.extend(list(range(start, end)))
+                slot_mapping_list.append(torch.arange(start, end, dtype=torch.int32))
             """
                 slot_mapping, 每个 seq 需要存储 kvcache 的 tokens 区间上 每个 token 的 start/end_block_id; 并在 batch 上平铺
             """
@@ -276,9 +276,10 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(
             cu_seqlens_k, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(
-            slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+        if slot_mapping_list:
+            slot_mapping = torch.cat(slot_mapping_list).cuda(non_blocking=True)
+        else:
+            slot_mapping = torch.empty(0, dtype=torch.int32).cuda(non_blocking=True)
 
         print(f"[DEBUG prepare_prefill] Setting context...")
         set_context(
