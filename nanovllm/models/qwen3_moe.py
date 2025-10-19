@@ -257,14 +257,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 if expert_idx >= self.total_num_experts:
                     continue
 
-                # FIXED: Correct expert computation with proper weight shapes
                 # gate_up computation
                 gate_up_output = F.linear(
                     token_hidden,
                     self.gate_up_weights[expert_idx],  # [hidden_size, 2*inter_size/tp]
                 )  # [2*inter_size/tp]
 
-                # The SiluAndMul activation handles both chunking and activation
                 activated = self.act_fn(gate_up_output)
 
                 # down projection
@@ -277,7 +275,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
             final_hidden_states[token_idx] = token_output
 
-        # FIXED: Correct TP all_gather - concatenate along hidden dimension
         if self.tp_size > 1:
             # Gather results across all TP ranks
             gathered_outputs = [
@@ -433,9 +430,7 @@ class Qwen3MoeForCausalLM(nn.Module):
 
                 for expert_id in range(num_experts_in_layer):
                     for ckpt_name, param_name_suffix, shard_id in expert_weights:
-                        param_name = (
-                            f"model.layers.{layer_idx}.mlp.{param_name_suffix}"
-                        )
+                        param_name = f"model.layers.{layer_idx}.mlp.{param_name_suffix}"
                         weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.{ckpt_name}.weight"
                         expert_mapping.append(
                             (param_name, weight_name, expert_id, shard_id)
