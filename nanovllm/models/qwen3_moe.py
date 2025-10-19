@@ -418,48 +418,31 @@ class Qwen3MoeForCausalLM(nn.Module):
             List of tuples: (param_name, weight_name, expert_id, shard_id)
         """
         expert_mapping = []
-        config = (
-            self.model.layers[0].mlp.config
-            if hasattr(self.model.layers[0].mlp, "config")
-            else None
-        )
+        config = getattr(self.model.layers[0].mlp, "config", None)
 
-        if config and hasattr(config, "num_experts"):
-            num_experts = config.num_experts
-            # Add expert mappings for all MoE layers
-            for layer_idx, layer in enumerate(self.model.layers):
-                if (
-                    hasattr(layer.mlp, "total_num_experts")
-                    and layer.mlp.total_num_experts > 0
-                ):
-                    # MoE layer - add expert mappings
-                    for expert_id in range(num_experts):
-                        # gate_proj -> gate_up_weights
-                        expert_mapping.append(
-                            (
-                                f"model.layers.{layer_idx}.mlp.gate_up_weights",
-                                f"model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight",
-                                expert_id,
-                                "gate",
-                            )
-                        )
-                        # up_proj -> gate_up_weights
-                        expert_mapping.append(
-                            (
-                                f"model.layers.{layer_idx}.mlp.gate_up_weights",
-                                f"model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight",
-                                expert_id,
-                                "up",
-                            )
-                        )
-                        # down_proj -> down_weights
-                        expert_mapping.append(
-                            (
-                                f"model.layers.{layer_idx}.mlp.down_weights",
-                                f"model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight",
-                                expert_id,
-                                "down",
-                            )
-                        )
+        if not (config and hasattr(config, "num_experts")):
+            return []
+
+        num_experts = config.num_experts
+        expert_weights = [
+            ("gate_proj", "gate_up_weights", "gate"),
+            ("up_proj", "gate_up_weights", "up"),
+            ("down_proj", "down_weights", "down"),
+        ]
+
+        for layer_idx, layer in enumerate(self.model.layers):
+            if not (
+                hasattr(layer.mlp, "total_num_experts")
+                and layer.mlp.total_num_experts > 0
+            ):
+                continue
+
+            for expert_id in range(num_experts):
+                for ckpt_name, param_name_suffix, shard_id in expert_weights:
+                    param_name = f"model.layers.{layer_idx}.mlp.{param_name_suffix}"
+                    weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.{ckpt_name}.weight"
+                    expert_mapping.append(
+                        (param_name, weight_name, expert_id, shard_id)
+                    )
 
         return expert_mapping
