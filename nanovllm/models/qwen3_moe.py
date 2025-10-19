@@ -419,12 +419,6 @@ class Qwen3MoeForCausalLM(nn.Module):
             List of tuples: (param_name, weight_name, expert_id, shard_id)
         """
         expert_mapping = []
-        config = getattr(self.model.layers[0].mlp, "config", None)
-
-        if not (config and hasattr(config, "num_experts")):
-            return []
-
-        num_experts = config.num_experts
         expert_weights = [
             ("gate_proj", "gate_up_weights", "gate"),
             ("up_proj", "gate_up_weights", "up"),
@@ -432,18 +426,22 @@ class Qwen3MoeForCausalLM(nn.Module):
         ]
 
         for layer_idx, layer in enumerate(self.model.layers):
-            if not (
-                hasattr(layer.mlp, "total_num_experts")
-                and layer.mlp.total_num_experts > 0
-            ):
+            # Check if this layer has an MLP block with experts
+            if not (hasattr(layer, "mlp") and hasattr(layer.mlp, "total_num_experts")):
                 continue
 
-            for expert_id in range(num_experts):
-                for ckpt_name, param_name_suffix, shard_id in expert_weights:
-                    param_name = f"model.layers.{layer_idx}.mlp.{param_name_suffix}"
-                    weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.{ckpt_name}.weight"
-                    expert_mapping.append(
-                        (param_name, weight_name, expert_id, shard_id)
-                    )
+            # If it's an MoE layer, get the total number of experts from it
+            if layer.mlp.total_num_experts > 0:
+                num_experts_in_layer = layer.mlp.total_num_experts
+
+                for expert_id in range(num_experts_in_layer):
+                    for ckpt_name, param_name_suffix, shard_id in expert_weights:
+                        param_name = (
+                            f"model.layers.{layer_idx}.mlp.{param_name_suffix}"
+                        )
+                        weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_id}.{ckpt_name}.weight"
+                        expert_mapping.append(
+                            (param_name, weight_name, expert_id, shard_id)
+                        )
 
         return expert_mapping
