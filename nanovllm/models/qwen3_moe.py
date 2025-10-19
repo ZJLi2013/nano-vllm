@@ -383,27 +383,13 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(nn.Module):
-    # packed_modules_mapping = {
-    #     "experts.gate_proj": ("gate_up_weights", "expert"),
-    #     "experts.up_proj": ("gate_up_weights", "expert"),
-    #     "experts.down_proj": ("down_weights", "expert"),
-    #     "q_proj": ("qkv_proj", "q"),
-    #     "k_proj": ("qkv_proj", "k"),
-    #     "v_proj": ("qkv_proj", "v"),
-    #     "gate_proj": ("gate_up_proj", 0),
-    #     "up_proj": ("gate_up_proj", 1),
-    # }
-
     packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
+        # Maps checkpoint weight name part to (model parameter name, shard_id)
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
     }
 
     def __init__(self, config: Qwen3Config) -> None:
